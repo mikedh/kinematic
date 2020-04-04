@@ -12,6 +12,9 @@ cross-convert GLTF Skeletons, OpenRave XML Robots, and URDF robots.
 
 Also, trimesh scenes aren't the greatest thing in the world. Maybe they would
 need a refactor?
+
+Uses sympy to produce numpy-lambdas for forward kinematics, which once computed
+are quite fast (for Python anyway) to execute.
 """
 
 import trimesh
@@ -57,8 +60,7 @@ class KinematicChain(object):
 
     @property
     def limits(self):
-        limits = np.array([j.limits for j in self.joints.values()])
-        limits.sort(axis=1)
+        limits = np.sort([j.limits for j in self.joints.values()], axis=1)
         return limits
 
     def graph(self):
@@ -70,14 +72,16 @@ class KinematicChain(object):
     def scene(self):
         geometries = {}
         for name, body in self.bodies.items():
-            geom = body.geometries
+            geom = body.geometry
             if len(geom) == 1:
                 geometries[name] = geom[0]
         return trimesh.Scene(geometries)
 
     def paths(self, base='base'):
         graph = self.graph()
-        paths = {b.name: nx.shortest_path(graph, base, b.name)
+        paths = {}
+
+        paths = {b.name: shortest(graph, base, b.name)
                  for b in self.bodies.values()}
 
         joints = {}
@@ -130,6 +134,16 @@ class KinematicChain(object):
                 for k, c in combined.items()}
 
 
+def shortest(graph, a, b):
+    try:
+        s = nx.shortest_path(graph, a, b)
+        return s
+    except BaseException:
+        print(graph.edges(), a, b)
+        s = nx.shortest_path(graph, b, a)
+        return s[::-1]
+
+
 def make_immutable(obj):
     """
     Make an object immutable-ish.
@@ -147,18 +161,35 @@ class Joint(trimesh.util.ABC):
     def matrix(self):
         raise NotImplementedError('call a subclass!')
 
-    @abc.abstractproperty
+    @property
     def connects(self):
-        raise NotImplementedError('call a subclass!')
+        return self._connects
+
+    @connects.setter
+    def connects(self, values):
+        if values is None or len(values) != 2:
+            raise ValueError('connects must be two body names!')
+        self._connects = values
+
+    @property
+    def limits(self):
+        if hasattr(self, '_limits'):
+            return self._limits
+        return [-np.inf, np.inf]
+
+    @limits.setter
+    def limits(self, values):
+        if values is not None:
+            self._limits = values
 
 
 class RotaryJoint(Joint):
     def __init__(self,
+                 name,
                  axis,
                  connects,
                  limits=None,
-                 anchor=None,
-                 name=None):
+                 anchor=None):
         """
         Create a rotary joint.
         """
@@ -196,24 +227,60 @@ class RotaryJoint(Joint):
             point=self.anchor)
         return matrix
 
-    @property
-    def connects(self):
-        return self._connects
 
-    @connects.setter
-    def connects(self, values):
-        if len(values) != 2:
-            raise ValueError()
-        self._connects = values
+class LinearJoint(Joint):
+    def __init__(self, name, axis, connects, limits=None):
+        """
+        Create a linear (also known as prismatic) joint.
+
+        Parameters
+        -------------
+        name : str
+          The name of the joint
+        axis : (3,) float
+          The vector along which the joint translates
+        connects : (2,) str
+          Which bodies does the joint connect
+        limits : None or (2,) float
+          What are the limits of the joint
+        """
+        self.parameter = sp.Symbol(name)
+        self.connects = connects
+
+        self.limits = limits
+
+        if axis is None or len(axis) != 3:
+            raise ValueError('axis must be (3,) float!')
+
+        # save axis as a unit vector
+        self.axis = np.array(axis, dtype=np.float64)
+        self.axis /= np.linalg.norm(self.axis)
+
+    @property
+    def matrix(self):
+        """
+        Get a parametrized transformation for this joint.
+
+        Returns
+        -----------
+        matrix : (4, 4) sp.Matrix
+          Transform parameterized by self.parameter
+        """
+        translation = sp.Matrix.eye(4)
+        translation[:3, 3] = self.axis * self.parameter
+        return translation
 
 
 class Body(object):
-    def __init__(self, name, geometries):
+    def __init__(self, name, geometry):
+        """
+        """
         self.name = name
-        self.geometries = geometries
+
+        self.geometry = geometry
 
     def show(self, **kwargs):
-        trimesh.Scene(self.geometries).show(**kwargs)
+        trimesh.Scene(self.geometry).show(**kwargs)
 
 
 def load_orxml(file_obj):
@@ -289,7 +356,7 @@ def load_orxml(file_obj):
         for g in b.iter('Geom'):
             if 'type' not in g.attrib:
                 continue
-            kind = g.attrib['type']
+            kind = g.attrib['type'].lower()
             if kind == 'trimesh':
                 loaded = None
                 try:
@@ -312,11 +379,13 @@ def load_orxml(file_obj):
                             i.visual.face_colors = color
                 except BaseException:
                     pass
-                if loaded is not None:
+                if len(loaded) > 0:
+                    #from IPython import embed
+                    # embed()
                     geom.extend(loaded)
         if len(geom) == 0:
             return {}
-        return {name: Body(name=name, geometries=geom)}
+        return {name: Body(name=name, geometry=geom)}
 
     bodies = {}
     joints = {}
