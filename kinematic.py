@@ -36,31 +36,47 @@ except BaseException as E:
 class KinematicChain(object):
     """
     A mechanism which consists of geometry (`Link` objects) connected
-    by transforms (`Joint` objects).
+    by variable transforms (`Joint` objects).
     """
 
     def __init__(self,
                  joints,
                  links,
-                 base_body='base'):
+                 base_link='base'):
         """
         Create a kinematic chain.
 
         Parameters
         --------------
-        joints : (n,) Joint objects
-            Connections between Links
+        joints : dict
+          Joint name to `Joint` objects
         links : (m,) Link object
-            Geometryy
+          Link name to `Link` objects
+        base_link : str
+          Name of base link
         """
+        # save passed joints and links
         self.joints = joints
-
-        # which body is the first
-        self.base_body = base_body
         self.links = links
+
+        # which link is the first
+        self.base_link = base_link
+
+    @property
+    def base_frame(self):
+        # TODO : figure something out here
+        return self.base_link
 
     @property
     def parameters(self):
+        """
+        What are the variables that define the state of the chain.
+
+        Returns
+        ---------
+        parameters : (n,) sympy.Symbol
+          Ordered parameters
+        """
         return [i.parameter for i in self.joints.values()]
 
     @property
@@ -69,37 +85,72 @@ class KinematicChain(object):
         return limits
 
     def graph(self):
+        """
+        Get a directed graph where joints are edges between links.
+
+        Returns
+        ----------
+        graph : networkx.DiGraph
+          Graph containing connectivity information
+        """
         graph = nx.DiGraph()
         for name, joint in self.joints.items():
             graph.add_edge(*joint.connects, joint=name)
         return graph
 
     def scene(self):
+        """
+        Get a scene containing the geometry for every link.
+
+        Returns
+        -----------
+        scene : trimesh.Scene
+          Scene with link geometry
+        """
         geometry = {}
         for name, link in self.links.items():
             geometry.update(link.geometry)
-        return trimesh.Scene(geometry)
+
+        base_frame = self.base_frame
+        graph = trimesh.scene.transforms.TransformForest()
+        graph.from_edgelist([(base_frame, geom_name, {'geometry': geom_name})
+                             for geom_name in geometry.keys()])
+        graph.update(frame_from=graph.base_frame, frame_to=base_frame)
+
+        scene = trimesh.Scene(geometry, graph=graph)
+        return scene
 
     def show(self):
+        """
+        Open a pyglet window showing all geometry.
+        """
         self.scene().show()
 
     def paths(self):
-        base = self.base_body
+        """
+        Find the route from the base body to every link.
+
+        Returns
+        ---------
+        joint_paths : dict
+          Keys are link names, values are a list of joint objects
+        """
+        base = self.base_link
         graph = self.graph()
         paths = {}
         for b in self.links.values():
             try:
                 paths[b.name] = shortest(graph, base, b.name)
             except BaseException as E:
-                print('exc', E)
+                print('exception:', E)
 
-        joints = {}
+        joint_paths = {}
         for body, path in paths.items():
-            joints[body] = [graph.get_edge_data(a, b)['joint']
-                            for a, b in zip(path[:-1], path[1:])]
-        return joints
+            joint_paths[body] = [graph.get_edge_data(a, b)['joint']
+                                 for a, b in zip(path[:-1], path[1:])]
+        return joint_paths
 
-    def transforms_symbolic(self):
+    def forward_kinematics(self):
         """
         Get the symbolic sympy forward kinematics.
 
@@ -127,7 +178,7 @@ class KinematicChain(object):
 
         return combined
 
-    def transforms(self):
+    def forward_kinematics_lambda(self):
         """
         Get a numpy-lambda for evaluating forward kinematics relatively
         quickly.
@@ -138,30 +189,37 @@ class KinematicChain(object):
           Link name to function which takes float values
           corresponding to self.parameters.
         """
-        combined = self.transforms_symbolic()
+        # a symbolic equation for every link
+        combined = self.forward_kinematics()
         return {k: sp.lambdify(self.parameters, c)
                 for k, c in combined.items()}
 
 
 def shortest(graph, a, b):
+    """
+    Try to find a shortest path between two nodes.
+
+    Parameters
+    -------------
+    graph : networkx.DiGraph
+      Graph with nodes
+    a : str
+      Source node
+    b : str
+      Destination node
+
+    Returns
+    ----------
+    path : (n,) str
+      Path between `a` and `b`
+    """
     try:
         s = nx.shortest_path(graph, a, b)
         return s
     except BaseException:
+        # try traversing the DiGraph backwards
         s = nx.shortest_path(graph, b, a)
         return s[::-1]
-
-
-def make_immutable(obj):
-    """
-    Make an object immutable-ish.
-
-    TODO : make most values of kinematic chains / joints / links
-    immutable so we can precompute stuff in the __init__
-    """
-    def immutable(*args, **kwargs):
-        raise ValueError('object is immutable!')
-    obj.__setattr__ = immutable
 
 
 class Joint(trimesh.util.ABC):
@@ -342,6 +400,87 @@ class Link(object):
         trimesh.Scene(self.geometry).show(**kwargs)
 
 
+def _parse_file(file_obj, ext):
+    """
+    Load an XML file from a file path or ZIP archive.
+
+    Parameters
+    ----------
+    file_obj : str
+      Path to an XML file or ZIP archive
+    ext : str
+      Desired extension of XML-like file
+
+    Returns
+    -----------
+    tree : lxml.etree.Etr
+    """
+    # make sure extension is in the format '.extension'
+    ext = '.' + ext.lower().strip().lstrip('.')
+
+    # load our file into an etree and a resolver
+    if trimesh.util.is_string(file_obj):
+        if file_obj.lower().endswith(ext):
+            # path was passed to actual XML file so resolver can use that path
+            resolver = trimesh.visual.resolvers.FilePathResolver(file_obj)
+            tree = etree.parse(file_obj)
+        elif file_obj.lower().endswith('.zip'):
+            # load the ZIP archive
+            with open(file_obj, 'rb') as f:
+                archive = trimesh.util.decompress(f, 'zip')
+            # find the first key in the archive that matches our extension
+            # this will be screwey if there are multiple XML files
+            key = next(k for k in archive.keys()
+                       if k.lower().endswith(ext))
+            # load the XML file into an etree
+            tree = etree.parse(archive[key])
+            # create a resolver from the archive
+            resolver = trimesh.visual.resolvers.ZipResolver(archive)
+        else:
+            raise ValueError(f'must be {ext} or ZIP with {ext} inside!')
+    else:
+        raise NotImplementedError('must load by file name')
+
+    return tree, resolver
+
+
+def _load_meshes(names, resolver):
+    """
+    Load a list of filenames from a resolver.
+
+    Parameters
+    -----------
+    names : (n,) str
+      List of file names
+    resolver : trimesh.visual.Resolver
+      Resolver which can load files
+
+    Returns
+    -----------
+    meshes : dict
+      Mesh name corresponding to mesh objects
+    """
+    meshes = {}
+    for file_name in names:
+        try:
+            loaded = trimesh.load(
+                file_obj=trimesh.util.wrap_as_stream(
+                    resolver.get(file_name)),
+                file_type=file_name)
+        except BaseException as E:
+            print('exception', E)
+            continue
+
+        if isinstance(loaded, trimesh.Trimesh):
+            meshes[file_name] = loaded
+        elif isinstance(loaded, trimesh.Scene):
+            meshes.update(loaded.geometry)
+        else:
+            print('not a known geometry type!')
+
+    return meshes
+
+
 def load_orxml(file_obj):
     """
     Load an OpenRAVE XML file from a ZIP or file path.
@@ -357,23 +496,7 @@ def load_orxml(file_obj):
       Loaded result from XML
     """
 
-    #import lxml
-    # load our file into an etree and a resolver
-    if trimesh.util.is_string(file_obj):
-        if file_obj.lower().endswith('.xml'):
-            resolver = trimesh.visual.resolvers.FilePathResolver(file_obj)
-            tree = etree.parse(file_obj)
-        elif file_obj.lower().endswith('zip'):
-            with open(file_obj, 'rb') as f:
-                archive = trimesh.util.decompress(f, 'zip')
-            key = next(k for k in archive.keys() if k.lower().endswith('.xml'))
-            tree = etree.parse(archive[key])
-
-            resolver = trimesh.visual.resolvers.ZipResolver(archive)
-        else:
-            raise ValueError('must be XML or ZIP with XML!')
-    else:
-        raise NotImplementedError('load by filename')
+    tree, resolver = _parse_file(file_obj=file_obj, ext='.xml')
 
     def parse_child(element, name):
         name = str(name).strip().lower()
@@ -413,7 +536,7 @@ def load_orxml(file_obj):
                 continue
             kind = g.attrib['type'].lower()
             if kind == 'trimesh':
-                geom.update(load_meshes(
+                geom.update(_load_meshes(
                     names=[c.text for c in g.iter('{*}collision')],
                     resolver=resolver))
         # try setting the diffuse color
@@ -443,29 +566,6 @@ def load_orxml(file_obj):
     return chain
 
 
-def load_meshes(names, resolver):
-
-    meshes = {}
-    for file_name in names:
-        try:
-            loaded = trimesh.load(
-                file_obj=trimesh.util.wrap_as_stream(
-                    resolver.get(file_name)),
-                file_type=file_name)
-        except BaseException as E:
-            print('exc', E)
-            continue
-
-        if isinstance(loaded, trimesh.Trimesh):
-            meshes[file_name] = loaded
-        elif isinstance(loaded, trimesh.Scene):
-            meshes.update(loaded.geometry)
-        else:
-            print('not a known geometry type!')
-
-    return meshes
-
-
 def load_urdf(file_obj):
     """
     Load an OpenRAVE XML file from a ZIP or file path.
@@ -483,21 +583,20 @@ def load_urdf(file_obj):
 
     def parse_origin(node):
         """
-        Function copied from `urdfpy`: find the `origin` subelement of an XML
-        node and convert it into a 4x4 homogenous transformation matrix.
+        Function mostly copied from `urdfpy`: find the `origin`
+        subelement of an XML node and convert it into a homogenous
+        transformation matrix.
 
         Parameters
         ----------
         node : :class`lxml.etree.Element`
-            An XML node which (optionally) has a child node with the ``origin``
-            tag.
+            An XML node which optionally has an `origin` child node
 
         Returns
         -------
-        matrix : (4,4) float
-            The 4x4 homogneous transform matrix that corresponds to this node's
-            ``origin`` child. Defaults to the identity matrix if no ``origin``
-            child was found.
+        matrix : (4, 4) float
+          Transform matrix that corresponds to node origin child
+          or identity matrix if no origin.
         """
         matrix = np.eye(4, dtype=np.float64)
         origin_node = node.find('origin')
@@ -508,22 +607,20 @@ def load_urdf(file_obj):
             if 'rpy' in origin_node.attrib:
                 rpy = np.array(origin_node.attrib['rpy'].split(),
                                dtype=np.float64)
+                # rpy notation is 'statix-zyz' in euler language
                 matrix[:3, :3] = trimesh.transformations.euler_matrix(
                     *rpy, axes='szyx')[:3, :3]
         return matrix
 
     def parse_joint(j):
-
         if 'type' not in j.attrib:
             return {}
         name = j.attrib['name']
         kind = j.attrib['type']
-
         if kind != 'revolute':
             return {}
         connects = (j.find('{*}parent').attrib['link'],
                     j.find('{*}child').attrib['link'])
-
         # initial transform of the joint
         initial = parse_origin(j)
         anchor = initial[:3, 3]
@@ -548,36 +645,17 @@ def load_urdf(file_obj):
         names = [m.attrib['filename']
                  for m in element.iter('{*}mesh')
                  if 'filename' in m.attrib]
-        meshes = load_meshes(names=names,
-                             resolver=resolver)
+        meshes = _load_meshes(names=names, resolver=resolver)
         return meshes
 
     def parse_link(L):
-
         name = L.attrib['name']
         meshes = parse_meshes(L.find('{*}visual'))
         body = Link(name=name,
                     geometry=meshes)
         return {name: body}
 
-    import lxml
-    # load our file into an etree and a resolver
-    if trimesh.util.is_string(file_obj):
-        if file_obj.lower().endswith('.xml'):
-            resolver = trimesh.visual.resolvers.FilePathResolver(file_obj)
-            tree = etree.parse(file_obj)
-        elif file_obj.lower().endswith('zip'):
-            with open(file_obj, 'rb') as f:
-                archive = trimesh.util.decompress(f, 'zip')
-            key = next(k for k in archive.keys()
-                       if k.lower().endswith('.urdf'))
-            tree = etree.parse(archive[key])
-
-            resolver = trimesh.visual.resolvers.ZipResolver(archive)
-        else:
-            raise ValueError('must be XML or ZIP with XML!')
-    else:
-        raise NotImplementedError('load by filename')
+    tree, resolver = _parse_file(file_obj=file_obj, ext='.urdf')
 
     links = {}
     joints = {}
@@ -586,46 +664,61 @@ def load_urdf(file_obj):
     for L in tree.iter('{*}link'):
         links.update(parse_link(L))
     chain = KinematicChain(
-        joints=joints, links=links, base_body='base_link')
+        joints=joints, links=links, base_link='base_link')
 
     return chain
 
 
-def show_bounce(chains, **kwargs):
+def show_bounce(chains, angle_per_step=0.01, **kwargs):
+    """
+    A basic demonstration which will visualize one or multiple
+    KinematicChain objects bounding between their joint limits.
+
+    Parameters
+    -----------
+    chains : dict or KinematicChain
+      One or multiple chains
+    kwargs : dict
+      Passed to scene.show
+    """
     def callback(scene):
-        """
-        A basic callback which moves the arm between it's joint limits.
-        """
         # use forward kinmatic functions to find new pose
         for chain_name, chain in chains.items():
             position = states[chain_name]
             for joint_name, F in forward[chain_name].items():
                 matrix = F(*position)
                 for geom_name in chain.links[joint_name].geometry.keys():
-                    scene.graph[geom_name] = matrix
+                    scene.graph.update(
+                        frame_from=chain.base_frame,
+                        frame_to=geom_name,
+                        matrix=matrix)
             # reverse the motion direction when we hit a joint limit
             reverse = ((position <= limits[chain_name][:, 0]) |
                        (position >= limits[chain_name][:, 1]))
             direction = directions[chain_name]
             direction[reverse] *= -1
-            position += np.ones(len(position)) * 0.01 * direction
+            position += np.ones(len(position)) * angle_per_step * direction
 
+    # if passed a single chain put it into a dict
     if isinstance(chains, KinematicChain):
         chains = {'single': chains}
 
+    # get a scene for every chain
     scenes = [c.scene() for c in chains.values()]
-
-    #offsets = np.append(0, np.cumsum([s.extents[0] * 2 for s in scenes]))[:-1]
-    # for o, s in zip(offsets, scenes):
-    #    s.apply_translation([o, 0, 0])
-
-    #from IPython import embed
-    # embed()
-
+    # append them into one scene
     scene = trimesh.scene.scene.append_scenes(scenes)
 
+    # find an offset so each chain is right next to the others
+    offset = np.append(0, np.cumsum(
+        [s.extents[0] * 1.1 for s in scenes]))[:-1]
+
+    for c, off in zip(chains.values(), offset):
+        # offset the base frame of each chain by the desired distance
+        scene.graph[c.base_frame] = trimesh.transformations.translation_matrix(
+            [off, 0, 0])
+
     # variables which will be in-scope for callback
-    forward = {k: c.transforms()
+    forward = {k: c.forward_kinematics_lambda()
                for k, c in chains.items()}
     limits = {k: c.limits
               for k, c in chains.items()}
@@ -633,19 +726,6 @@ def show_bounce(chains, **kwargs):
                   for k, c in chains.items()}
     states = {k: np.zeros(len(c.joints))
               for k, c in chains.items()}
-
-    """
-    # get a scene containing the chain
-    scene = chain.scene()
-    # numpy lambdas for forward kinematics
-    forward = chain.transforms()
-    # joint limits
-    limits = chain.limits
-    # store the direction of motion for the joints
-    scene.direction = np.ones(len(chain.joints))
-    # save the joint position to the scene
-    scene.state = np.zeros(len(chain.joints))
-    """
 
     # show the robot moving with a callback
     scene.show(callback=callback, **kwargs)
@@ -663,5 +743,6 @@ if __name__ == '__main__':
     profiler.stop()
     print(profiler.output_text(unicode=True, color=True))
 
-    #show_bounce({'abb': abb, 'ur5': ur5})
-    show_bounce(abb)
+    show_bounce({'abb': abb, 'ur5': ur5})
+
+    m = trimesh.load('robots/RiggedFigure.glb')
