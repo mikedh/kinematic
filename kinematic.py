@@ -10,9 +10,6 @@ could feasibly live as `trimesh.kinematic`.
 Challenge: create a data structure which can (mostly) hold and
 cross-convert GLTF Skeletons, OpenRave XML Robots, and URDF robots.
 
-Also, trimesh scenes aren't the greatest thing in the world. Maybe they would
-need a refactor?
-
 Uses sympy to produce numpy-lambdas for forward kinematics, which once computed
 are quite fast (for Python anyway) to execute.
 """
@@ -24,8 +21,9 @@ import sympy as sp
 import numpy as np
 import networkx as nx
 
+ABC = trimesh.util.ABC
 # for debugging
-from trimesh.exchange.xml_based import print_element as pp  # NOQA
+from trimesh.exchange.threedxml import print_element as pp  # NOQA
 
 try:
     import lxml.etree as etree
@@ -81,7 +79,8 @@ class KinematicChain(object):
 
     @property
     def limits(self):
-        limits = np.sort([j.limits for j in self.joints.values()], axis=1)
+        limits = np.sort([j.limits for j in
+                          self.joints.values()], axis=1)
         return limits
 
     def graph(self):
@@ -112,8 +111,9 @@ class KinematicChain(object):
             geometry.update(link.geometry)
 
         base_frame = self.base_frame
-        graph = trimesh.scene.transforms.TransformForest()
-        graph.from_edgelist([(base_frame, geom_name, {'geometry': geom_name})
+        graph = trimesh.scene.transforms.SceneGraph()
+        graph.from_edgelist([(base_frame, geom_name,
+                              {'geometry': geom_name})
                              for geom_name in geometry.keys()])
         graph.update(frame_from=graph.base_frame, frame_to=base_frame)
 
@@ -222,7 +222,7 @@ def shortest(graph, a, b):
         return s[::-1]
 
 
-class Joint(trimesh.util.ABC):
+class Joint(ABC):
     """
     The base class for `Joint` objects, or connections
     between `Link` objects which contain geometry.
@@ -255,7 +255,7 @@ class Joint(trimesh.util.ABC):
     @connects.setter
     def connects(self, values):
         if values is None or len(values) != 2:
-            raise ValueError('connects must be two body names!')
+            raise ValueError('`connects` must be two link names!')
         self._connects = values
 
     @property
@@ -287,26 +287,26 @@ class RotaryJoint(Joint):
         Parameters
         -------------
         name : str
-          The name of this joint
+          The name of this joint.
         axis : (3,) float
-          The axis this joint revolves around
+          The unit vector this joint revolves around.
         connects : (2,) str
           The name of the two `Link` objects this joint connects
         initial : None or (4, 4) float
-          Initial transformation
+          Initial transformation.
         limits : None or (2,) float
-          The limits of this joint
+          The limits of this joint in radians.
         anchor : None or (3,) float
           The point in space anchoring this joint,
           also known as the origin of the axis line
         """
         # the unit vector axis
-        self.axis = np.asanyarray(axis, dtype=np.float64).reshape(3)
+        self.axis = np.array(axis, dtype=np.float64).reshape(3)
         # the point around which to rotate
         if anchor is None:
             self.anchor = np.zeros(3)
         else:
-            self.anchor = np.asanyarray(anchor, dtype=np.float64)
+            self.anchor = np.array(anchor, dtype=np.float64)
         # the name of the joint
         self.name = name
 
@@ -698,7 +698,6 @@ def show_bounce(chains, angle_per_step=0.01, **kwargs):
             direction = directions[chain_name]
             direction[reverse] *= -1
             position += np.ones(len(position)) * angle_per_step * direction
-
     # if passed a single chain put it into a dict
     if isinstance(chains, KinematicChain):
         chains = {'single': chains}
@@ -707,6 +706,12 @@ def show_bounce(chains, angle_per_step=0.01, **kwargs):
     scenes = [c.scene() for c in chains.values()]
     # append them into one scene
     scene = trimesh.scene.scene.append_scenes(scenes)
+
+    scene.camera_transform = [
+        [0.9904557, 0., -0.13783142, 0.14432819],
+        [-0.13766048, 0.04978808, -0.98922734, -2.04164079],
+        [0.00686236, 0.9987598, 0.04931289, 0.48014882],
+        [0., 0., 0., 1.]]
 
     # find an offset so each chain is right next to the others
     offset = np.append(0, np.cumsum(
@@ -722,13 +727,17 @@ def show_bounce(chains, angle_per_step=0.01, **kwargs):
                for k, c in chains.items()}
     limits = {k: c.limits
               for k, c in chains.items()}
-    directions = {k: np.ones(len(c.joints))
+    directions = {k: -1 * np.ones(len(c.joints))
                   for k, c in chains.items()}
-    states = {k: np.zeros(len(c.joints))
+    states = {k: c.limits.mean(axis=1)
               for k, c in chains.items()}
+    states['abb'] = np.zeros(6)
+    states['ur5'] = np.ones(6) * -np.radians(90)
 
     # show the robot moving with a callback
-    scene.show(callback=callback, **kwargs)
+    scene.show(callback=callback, record=True, **kwargs)
+
+    return scene
 
 
 if __name__ == '__main__':
@@ -743,6 +752,4 @@ if __name__ == '__main__':
     profiler.stop()
     print(profiler.output_text(unicode=True, color=True))
 
-    show_bounce({'abb': abb, 'ur5': ur5})
-
-    m = trimesh.load('robots/RiggedFigure.glb')
+    r = show_bounce({'abb': abb, 'ur5': ur5})
